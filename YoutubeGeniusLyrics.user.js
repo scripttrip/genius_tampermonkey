@@ -4,7 +4,7 @@
 // @description     Enhanced version of YouTube Genius Lyrics with custom themes and adjustable scroll speeds
 
 // @license         GPL-3.0-or-later; http://www.gnu.org/licenses/gpl-3.0.txt
-// @copyright       2024, Custom Version (Original by cuzi https://github.com/cvzi)
+// @copyright       2024, Custom Version (Original by mazz https://github.com/cvzi)
 // @author          Custom Version (scripttrip)
 // @icon            https://raw.githubusercontent.com/scripttrip/genius_tampermonkey/refs/heads/main/11.png
 // @supportURL      https://github.com/scripttrip/genius_tampermonkey/issues
@@ -27,7 +27,7 @@
 // ==/UserScript==
 
 /*
-    Original Copyright (C) 2020 cuzi (cuzi@openmail.cc)
+    Original Copyright (C) 2020 mazz (mazz@openmail.cc)
     Customized version with additional features
     
     This program is free software: you can redistribute it and/or modify
@@ -60,6 +60,9 @@ let iframeBlankURL = null
 // Custom variables for enhanced features
 let currentScrollSpeed = 'normal' // 'slow', 'normal', 'fast'
 let currentTheme = 'default' // 'default', 'dark', 'light', 'spotify', 'youtube'
+let customWidth = null; // Store custom width for the lyrics container
+let customHeight = null; // Store custom height for the lyrics container
+let isResizing = false; // Track if user is currently resizing
 
 const EXCLUDE_LIVE_VIDEO = true // this should be configurable in "options" ? [>=25min]
 const EXCLUDE_SHORT_LEN = true // this should be configurable in "options" ? [<15s]
@@ -190,6 +193,8 @@ function addCss () {
       font-size: 1.4rem;
       border: 0;
       border-radius: 0;
+      resize: both;
+      overflow: hidden;
 
       background: var(--lyrics-bg-color, var(--ytd-searchbox-background));
       color: var(--lyrics-text-color, var(--ytd-searchbox-text-color));
@@ -200,6 +205,26 @@ function addCss () {
 
       width: calc(var(--ygl-container-width, 324px) - var(--ytd-margin-6x, 24px) + 7px);
       right: calc(var(--ygl-container-right) - 1px);
+      min-width: 250px;
+      min-height: 200px;
+    }
+
+    /* Resize handle styles */
+    .lyrics-resize-handle {
+      position: absolute;
+      width: 15px;
+      height: 15px;
+      bottom: 0;
+      right: 0;
+      cursor: nwse-resize;
+      background: var(--lyrics-accent-color, var(--yt-live-chat-toast-action-color));
+      clip-path: polygon(100% 0, 100% 100%, 0 100%);
+      opacity: 0.7;
+      z-index: 2010;
+    }
+
+    .lyrics-resize-handle:hover {
+      opacity: 1;
     }
 
     #lyricsiframe {
@@ -1830,12 +1855,20 @@ async function updateAutoScroll (video, force) {
       let cbFactor = 1.0
       if (ct > 0 && ct < duration) {
         const s = ct / duration // (0,1)
-        const s1 = await cbLyricsTime(s) // (0,1)
+        // Get the adjusted scroll position based on current speed setting
+        const s1 = await scrollSpeedCurves[currentScrollSpeed](s) // (0,1)
         cbFactor = s1 / s
       }
       pos = ct / duration * cbFactor
     }
-    genius.f.scrollLyrics(pos)
+    try {
+      // Use a more robust call to ensure the lyrics scroll
+      if (typeof genius.f.scrollLyrics === 'function') {
+        genius.f.scrollLyrics(pos)
+      }
+    } catch (err) {
+      console.warn('Error during lyrics scroll:', err)
+    }
   }
   await new Promise(requestAnimationFrame) /* eslint-disable-line no-new */
   isUpdateAutoScrollBusy = false
@@ -2175,6 +2208,63 @@ function setupLyricsDisplayDOM (song, searchresultsLengths) { // eslint-disable-
   iframe.id = 'lyricsiframe'
   iframe.style.opacity = 0.1
 
+  // Add resize handle
+  const resizeHandle = document.createElement('div');
+  resizeHandle.classList.add('lyrics-resize-handle');
+  
+  // Initialize resize functionality
+  resizeHandle.addEventListener('mousedown', function(e) {
+    isResizing = true;
+    
+    // Prevent iframe from capturing mouse events during resize
+    iframe.style.pointerEvents = 'none';
+    
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startWidth = container.offsetWidth;
+    const startHeight = container.offsetHeight;
+    
+    const onMouseMove = function(e) {
+      if (!isResizing) return;
+      
+      // Calculate new size
+      const newWidth = startWidth + startX - e.clientX;
+      const newHeight = startHeight + e.clientY - startY;
+      
+      // Apply new size with minimums
+      if (newWidth >= 250) {
+        container.style.width = newWidth + 'px';
+        customWidth = newWidth;
+      }
+      
+      if (newHeight >= 200) {
+        container.style.height = newHeight + 'px';
+        customHeight = newHeight;
+      }
+    };
+    
+    const onMouseUp = function() {
+      isResizing = false;
+      
+      // Re-enable iframe events
+      iframe.style.pointerEvents = '';
+      
+      // Save custom size
+      if (customWidth && customHeight) {
+        GM.setValue('lyrics_custom_width', customWidth);
+        GM.setValue('lyrics_custom_height', customHeight);
+      }
+      
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+    };
+    
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    
+    e.preventDefault();
+  });
+
   // flush to DOM tree
   appendElements(bar, [
     controlsDiv,
@@ -2184,7 +2274,11 @@ function setupLyricsDisplayDOM (song, searchresultsLengths) { // eslint-disable-
     separator.cloneNode(true),
     hideButton
   ])
-  appendElements(container, [bar, iframe])
+  appendElements(container, [bar, iframe, resizeHandle])
+
+  // Apply saved custom size if available
+  if (customWidth) container.style.width = customWidth + 'px';
+  if (customHeight) container.style.height = customHeight + 'px';
 
   // clean up
   separator = null
@@ -2788,10 +2882,14 @@ function entryPoint () {
     // Load saved settings
     Promise.all([
       GM.getValue('lyrics_theme', 'default'),
-      GM.getValue('lyrics_scroll_speed', 'normal')
-    ]).then(([savedTheme, savedScrollSpeed]) => {
+      GM.getValue('lyrics_scroll_speed', 'normal'),
+      GM.getValue('lyrics_custom_width', null),
+      GM.getValue('lyrics_custom_height', null)
+    ]).then(([savedTheme, savedScrollSpeed, savedWidth, savedHeight]) => {
       currentTheme = savedTheme;
       currentScrollSpeed = savedScrollSpeed;
+      customWidth = savedWidth;
+      customHeight = savedHeight;
       
       // Apply theme to document immediately
       if (document.documentElement) {
@@ -2835,10 +2933,14 @@ function entryPoint () {
     function resetCustomSettings() {
       currentTheme = 'default';
       currentScrollSpeed = 'normal';
+      customWidth = null;
+      customHeight = null;
       
       // Save the default values
       GM.setValue('lyrics_theme', currentTheme);
       GM.setValue('lyrics_scroll_speed', currentScrollSpeed);
+      GM.setValue('lyrics_custom_width', null);
+      GM.setValue('lyrics_custom_height', null);
       
       // Apply theme to document
       document.documentElement.setAttribute('data-lyrics-theme', currentTheme);
@@ -2849,6 +2951,13 @@ function entryPoint () {
       
       const speedSelector = document.querySelector('.lyrics-speed-selector');
       if (speedSelector) speedSelector.value = currentScrollSpeed;
+      
+      // Reset container size if it exists
+      const container = document.getElementById('lyricscontainer');
+      if (container) {
+        container.style.width = '';
+        container.style.height = '';
+      }
       
       // Notify user
       const notification = document.createElement('div');
@@ -2981,6 +3090,39 @@ function entryPoint () {
           // Update selector if it exists
           const speedSelector = document.querySelector('.lyrics-speed-selector');
           if (speedSelector) speedSelector.value = currentScrollSpeed;
+        }
+      });
+      
+      // Listen for custom size changes from other tabs
+      GM_addValueChangeListener('lyrics_custom_width', function(name, old_value, new_value, remote) {
+        if (remote) {
+          customWidth = new_value;
+          
+          // Update container if it exists
+          const container = document.getElementById('lyricscontainer');
+          if (container) {
+            if (customWidth) {
+              container.style.width = customWidth + 'px';
+            } else {
+              container.style.width = '';
+            }
+          }
+        }
+      });
+      
+      GM_addValueChangeListener('lyrics_custom_height', function(name, old_value, new_value, remote) {
+        if (remote) {
+          customHeight = new_value;
+          
+          // Update container if it exists
+          const container = document.getElementById('lyricscontainer');
+          if (container) {
+            if (customHeight) {
+              container.style.height = customHeight + 'px';
+            } else {
+              container.style.height = '';
+            }
+          }
         }
       });
     }
